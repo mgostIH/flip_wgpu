@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["Pillow>=9.0"]
 # ///
-"""Sample image pairs and compare the Rust wgpu implementation to FLIP CPU/CUDA."""
+"""Sample image pairs and compare native and fallback wgpu adapters."""
 
 from __future__ import annotations
 
@@ -24,9 +24,8 @@ from PIL import Image
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-FLIP_ROOT = (WORKSPACE / "../../Github/flip").resolve()
-DEFAULT_IMAGES = FLIP_ROOT / "images"
-DEFAULT_ENGINES = ["wgpu-gpu", "wgpu-cpu", "flip-cpp", "flip-cuda"]
+DEFAULT_IMAGES = WORKSPACE / "tests/fixtures"
+DEFAULT_ENGINES = ["wgpu-gpu", "wgpu-cpu"]
 SCORE_KEYS = [
     "mean",
     "weighted_median",
@@ -48,7 +47,7 @@ SCORE_PATTERNS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Randomly sample image pairs and compare wgpu FLIP to FLIP's CPU/CUDA tools."
+        description="Randomly sample image pairs and compare native and fallback wgpu adapters."
     )
     parser.add_argument("--manifest", type=Path, help="CSV with name,reference,test columns")
     parser.add_argument("--images-dir", type=Path, default=DEFAULT_IMAGES)
@@ -129,7 +128,7 @@ def build_command(engine: str, case: dict, output_map: Path) -> list[str]:
     test = str(case["test"])
     hdr = Path(reference).suffix.lower() == ".exr"
     if engine.startswith("wgpu-"):
-        executable = WORKSPACE / "target/release/wgpu_test"
+        executable = WORKSPACE / "target/release/flip-wgpu"
         command = [
             str(executable), "--reference", reference, "--test", test,
             "--output", str(output_map), "--verbosity", "2", "--no-exposure-map",
@@ -137,15 +136,7 @@ def build_command(engine: str, case: dict, output_map: Path) -> list[str]:
         if engine == "wgpu-cpu":
             command.append("--force-fallback-adapter")
         return command
-
-    executable = FLIP_ROOT / "build" / ("flip-cuda" if engine == "flip-cuda" else "flip")
-    command = [
-        str(executable), "--reference", reference, "--test", test,
-        "--directory", str(output_map.parent), "--basename", output_map.stem, "--verbosity", "2",
-    ]
-    if hdr:
-        command.append("--no-exposure-map")
-    return command
+    raise ValueError(f"unknown engine: {engine}")
 
 
 def parse_result(output: str) -> dict:
@@ -246,7 +237,7 @@ def main() -> int:
     maps_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    binary = WORKSPACE / "target/release/wgpu_test"
+    binary = WORKSPACE / "target/release/flip-wgpu"
     if not args.no_build and any(engine.startswith("wgpu-") for engine in args.engines):
         build = subprocess.run(["cargo", "build", "--release"], cwd=WORKSPACE, text=True)
         if build.returncode:
@@ -259,7 +250,6 @@ def main() -> int:
     report = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "workspace": str(WORKSPACE),
-        "flip_root": str(FLIP_ROOT),
         "fraction": args.fraction,
         "seed": args.seed,
         "engines": args.engines,
@@ -293,7 +283,7 @@ def main() -> int:
             try:
                 process = subprocess.run(
                     command,
-                    cwd=WORKSPACE if engine.startswith("wgpu-") else FLIP_ROOT,
+                    cwd=WORKSPACE,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -345,31 +335,29 @@ def main() -> int:
             with runs_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"case": name, "engine": engine, **result}, sort_keys=True) + "\n")
 
-        oracle_engines = [engine for engine in ("flip-cpp", "flip-cuda") if engine in map_paths]
-        candidate_engines = [engine for engine in ("wgpu-gpu", "wgpu-cpu") if engine in map_paths]
+        engines = [engine for engine in DEFAULT_ENGINES if engine in map_paths]
         accuracy_ok = None
-        if oracle_engines and candidate_engines:
+        if len(engines) == 2:
             accuracy_ok = True
-            for candidate in candidate_engines:
-                for oracle in oracle_engines:
-                    comparison = compare_maps(map_paths[candidate], map_paths[oracle])
-                    key = f"{candidate}_vs_{oracle}"
-                    case_report["map_comparisons"][key] = comparison
-                    candidate_result = case_report["engines"][candidate]
-                    oracle_result = case_report["engines"][oracle]
-                    score_deltas = {
-                        score: abs(candidate_result[score] - oracle_result[score])
-                        for score in SCORE_KEYS
-                        if score in candidate_result and score in oracle_result
-                    }
-                    case_report.setdefault("score_deltas", {})[key] = score_deltas
-                    scores_ok = bool(score_deltas) and max(score_deltas.values()) <= args.score_tolerance
-                    maps_ok = comparison.get("same_size", False) and comparison["max_channel_delta"] <= args.map_channel_tolerance
-                    accuracy_ok = accuracy_ok and scores_ok and maps_ok
+            native, fallback = engines
+            comparison = compare_maps(map_paths[native], map_paths[fallback])
+            key = f"{native}_vs_{fallback}"
+            case_report["map_comparisons"][key] = comparison
+            native_result = case_report["engines"][native]
+            fallback_result = case_report["engines"][fallback]
+            score_deltas = {
+                score: abs(native_result[score] - fallback_result[score])
+                for score in SCORE_KEYS
+                if score in native_result and score in fallback_result
+            }
+            case_report.setdefault("score_deltas", {})[key] = score_deltas
+            scores_ok = bool(score_deltas) and max(score_deltas.values()) <= args.score_tolerance
+            maps_ok = comparison.get("same_size", False) and comparison["max_channel_delta"] <= args.map_channel_tolerance
+            accuracy_ok = scores_ok and maps_ok
         case_report["accuracy_ok"] = accuracy_ok
         if accuracy_ok is False:
             all_ok = False
-        accuracy_label = "PASS" if accuracy_ok else ("FAIL" if accuracy_ok is False else "SKIP (no candidate/oracle pair)")
+        accuracy_label = "PASS" if accuracy_ok else ("FAIL" if accuracy_ok is False else "SKIP (only one adapter run)")
         print(f"  map/score match within configured tolerances: {accuracy_label}", flush=True)
         report["cases"].append(case_report)
         write_partial_report(report_path, report)

@@ -1,151 +1,210 @@
-# wgpu FLIP
+# flip-wgpu
 
-A Rust implementation of NVIDIA's FLIP image comparison metric. The color conversion,
-spatial filtering, feature filtering, and per-pixel error calculation run in WGSL compute
-shaders through `wgpu`. PNG provides the LDR input path; EXR provides linear HDR input.
+`flip-wgpu` is a Rust crate that implements NVIDIA's
+[FLIP project](https://github.com/NVlabs/flip) perceptual image comparison
+metric with `wgpu` compute shaders. It has three entry points:
 
-## Run
+- A reusable Rust API for RGB8 and HDR pixel slices, using a `wgpu::Device` and
+  `wgpu::Queue` supplied by your application.
+- GPU-buffer and texture methods for applications that already keep image data
+  on the device.
+- Public WGSL source strings for projects that want to build their own pipeline.
 
-The original three-path form still works:
+The `flip-wgpu` binary adds PNG and EXR file loading, error-map output, summary
+statistics, and the existing HDR exposure options. The crate and its tests do not
+build or call the C++ or CUDA implementations.
+
+![FLIP comparison showing the reference image, test image, and this project's Magma error map](docs/images/flip-example.png)
+
+The sample image pair is from [NVlabs/flip](https://github.com/NVlabs/flip).
+`flip-wgpu` produces the error map; the mean FLIP error for this pair is
+`0.159691`.
+
+## Use it from another project
+
+Add the GitHub repository as a dependency:
+
+```toml
+[dependencies]
+flip-wgpu = { git = "https://github.com/mgostIH/flip_wgpu", default-features = false }
+wgpu = "30"
+```
+
+Disabling default features keeps PNG, EXR, and command-line support out of the
+dependency graph. Enable the `cli` feature if you need those helpers. The crate
+currently targets the same `wgpu` 30 API as the application.
+
+### Compare decoded images
+
+The evaluator keeps its pipelines and working buffers, so create one for each
+image size and viewing configuration and reuse it for multiple pairs:
+
+```rust
+use flip_wgpu::{FlipEvaluator, FlipOptions};
+
+async fn compare() -> Result<(), Box<dyn std::error::Error>> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await?;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default())
+        .await?;
+
+    // Pixels are row-major RGB bytes in sRGB space, with the origin at the top left.
+    let reference = [[32, 96, 180], [240, 220, 180]];
+    let test = [[32, 96, 180], [220, 205, 170]];
+    let mut flip = FlipEvaluator::new(
+        &device,
+        &queue,
+        2,
+        1,
+        FlipOptions::default(),
+    )?;
+    let result = flip.evaluate_ldr(&reference, &test)?;
+    let mean = result.errors.iter().sum::<f32>() / result.errors.len() as f32;
+    println!("mean FLIP error: {mean:.6}");
+    println!("error at pixel (1, 0): {:.6}", result.errors[1]);
+    Ok(())
+}
+```
+
+`FlipOptions::default()` uses FLIP's default 67.020645 pixels per degree and the
+ACES tone mapper. Set `pixels_per_degree` to match the display and viewing
+distance for the images being compared. The library returns one error value per
+pixel in row-major order; values range from zero to one.
+
+For HDR, pass linear RGBA `f32` pixels. Alpha is ignored. By default, the
+reference image determines the exposure range, as it does in the CLI:
+
+```rust
+use flip_wgpu::{FlipEvaluator, FlipOptions, HdrOptions, ToneMapper};
+
+# fn evaluate(device: &wgpu::Device, queue: &wgpu::Queue, reference: &[[f32; 4]], test: &[[f32; 4]]) -> Result<(), Box<dyn std::error::Error>> {
+let mut flip = FlipEvaluator::new(
+    device,
+    queue,
+    1920,
+    1080,
+    FlipOptions { tone_mapper: ToneMapper::Aces, ..Default::default() },
+)?;
+let result = flip.evaluate_hdr(reference, test, HdrOptions::default())?;
+assert_eq!(result.errors.len(), 1920 * 1080);
+assert_eq!(result.exposures.len(), result.errors.len());
+# Ok(()) }
+```
+
+Set any of `start_exposure`, `stop_exposure`, and `exposure_count` in
+`HdrOptions` to override automatic HDR settings. Exposure values are in stops;
+there must be at least two samples and the start must not exceed the stop.
+
+### Keep input pixels on the GPU
+
+The buffer methods copy input data between buffers on the same device and return
+per-pixel results to CPU memory. LDR buffers contain one packed `u32` per pixel:
+`red | (green << 8) | (blue << 16)`. HDR buffers contain row-major `[f32; 4]`
+pixels with linear RGB. Each input buffer needs `COPY_SRC` usage and must be at
+least `width * height * 4` bytes for LDR or `width * height * 16` bytes for HDR.
+
+For renderer-owned textures, use `evaluate_ldr_textures` with
+`Rgba8UnormSrgb` or `evaluate_hdr_textures` with `Rgba32Float`. Texture
+dimensions must match the evaluator and each texture needs `COPY_SRC` usage.
+These calls also keep the inputs on the GPU. HDR texture and buffer methods
+require an explicit exposure start, stop, and count; automatic exposure range
+selection is available from the HDR slice method.
+
+```rust
+use flip_wgpu::{FlipEvaluator, FlipOptions};
+use wgpu::util::DeviceExt;
+
+# fn compare(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), Box<dyn std::error::Error>> {
+let reference = [0x00_60_20_u32, 0x00_b0_80_u32];
+let test = [0x00_60_20_u32, 0x00_a0_70_u32];
+let reference_bytes: Vec<u8> = reference.iter().flat_map(|pixel| pixel.to_ne_bytes()).collect();
+let test_bytes: Vec<u8> = test.iter().flat_map(|pixel| pixel.to_ne_bytes()).collect();
+let reference_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    label: Some("reference RGB pixels"),
+    contents: &reference_bytes,
+    usage: wgpu::BufferUsages::COPY_SRC,
+});
+let test_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    label: Some("test RGB pixels"),
+    contents: &test_bytes,
+    usage: wgpu::BufferUsages::COPY_SRC,
+});
+let mut flip = FlipEvaluator::new(device, queue, 2, 1, FlipOptions::default())?;
+let result = flip.evaluate_ldr_buffers(&reference_buffer, &test_buffer)?;
+# let _ = result;
+# Ok(()) }
+```
+
+Result readback is synchronous and waits for the submitted GPU work to finish.
+
+### Use the WGSL source directly
+
+The source strings are available as `flip_wgpu::shaders::LDR_CONVERT`,
+`HDR_CONVERT`, `SPATIAL`, `FEATURES`, and `HDR_MAXIMUM`. For example:
+
+```rust
+# fn create_shader(device: &wgpu::Device) {
+let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    label: Some("FLIP LDR conversion"),
+    source: wgpu::ShaderSource::Wgsl(flip_wgpu::shaders::LDR_CONVERT.into()),
+});
+# let _ = module;
+# }
+```
+
+The constants provide the shader text, not a stable standalone shader API.
+The entry points, bind group layouts, and parameter buffer layouts are internal
+and are documented in the WGSL files themselves. Use `FlipEvaluator` when you
+want FLIP's full filtering and evaluation pipeline without managing those
+layouts. The Magma and Viridis lookup arrays are available at
+`flip_wgpu::palettes::MAGMA` and `flip_wgpu::palettes::VIRIDIS`.
+
+## Command line
+
+Run the included binary from this repository:
 
 ```sh
-cargo run -- reference.png test.png error-map.png
-cargo run -- reference.exr test.exr error-map.png
+cargo run --release -- --help
+cargo run --release -- reference.png test.png error-map.png
+cargo run --release -- --reference reference.exr --test test.exr --tone-mapper hable
 ```
 
-Or use FLIP-style named options. `--test` accepts multiple paths:
+The CLI writes a Magma error map by default. For HDR it also writes an exposure
+map showing which exposure produced the maximum error. `--no-error-map`,
+`--no-exposure-map`, and `--no-magma` adjust those outputs. `--directory`,
+`--basename`, `--textfile`, and `--csv PATH` control output names and summary
+files. `--profile-gpu` reports pass timings when the selected adapter supports
+timestamp queries. The positional three-path form and FLIP-style named options
+are both supported.
+
+## Tests and fixtures
+
+`cargo test` runs Rust tests using bundled sample images: reference PNG and EXR
+pairs, plus the original C++ LDR and HDR result maps as conformance references.
+The tests run the wgpu implementation directly; they do not require the FLIP
+C++/CUDA programs, Python, or a separately built binary.
+If no wgpu adapter is available, the GPU conformance test reports a skip.
+
+The reference result maps are compared with a three-channel tolerance of 3 to
+allow small floating-point differences between GPU implementations. The mean
+scores are checked against `0.159691` for LDR and `0.283478` for HDR/ACES.
+
+For an optional side-by-side check of native and fallback wgpu adapters on more
+image pairs, run the Python utility below. It does not call the original FLIP
+executables; Python and Pillow are only needed for this development report.
 
 ```sh
-cargo run -- --reference reference.png --test test-a.png test-b.png --directory results
-cargo run -- --reference reference.exr --test test.exr --tone-mapper hable
+uv run scripts/compare_flip.py --fraction 1 --seed 20260925
 ```
 
-The default viewing scale is 67.020645 pixels per degree. Set it directly with
-`--pixels-per-degree`, or derive it from monitor distance, width, and horizontal pixel
-resolution with `--viewing-conditions DISTANCE WIDTH PIXELS`. HDR tone mappers are
-`aces` (default), `hable`, and `reinhard`. HDR start/stop exposure and exposure count
-can be overridden with `--start-exposure`, `--stop-exposure`, and `--num-exposures`.
+## License and provenance
 
-By default the program writes a Magma-colored FLIP error map. For HDR it also writes a
-Viridis exposure map that shows which exposure produced each pixel's maximum error.
-Use `--no-error-map`, `--no-exposure-map`, or `--no-magma` to change those outputs.
-`--basename` names outputs, `--directory` selects their folder, `--textfile` saves the
-summary beside the error map, and `--csv PATH` appends summary rows to a CSV file.
-Run `cargo run -- --help` for all options. Histogram plots, exit-on-threshold, and
-exporting all intermediate HDR images are not implemented.
-Use `--profile-gpu` to print GPU times for the compute passes when the adapter supports
-timestamp queries. For HDR, it profiles the final exposure; the other exposures run
-the same passes.
-
-## What the result means
-
-FLIP produces a value between 0 and 1 for every pixel. Zero means that pixel is
-perceptually alike in the two inputs; values nearer one indicate a larger perceptual
-difference. The PNG is a false-color visualization of this per-pixel error image. It is
-not a reconstructed or blended difference image.
-
-The printed mean is the overall FLIP score. The weighted median and weighted quartiles
-describe the distribution of error while giving larger errors more weight; min and max
-show the endpoints. In HDR mode, FLIP tone maps a sequence of exposures, computes LDR
-FLIP at each exposure, and keeps the largest error and its exposure at every pixel.
-
-## Reproduce the comparisons
-
-The sampler compares the Rust implementation with the C++ and CUDA executables from
-`../../Github/flip`. It runs engines serially, samples cases reproducibly, saves maps,
-and checks both summary values and per-pixel map differences. It has no persistent
-daemon; each invocation exits after its selected cases finish.
-
-```sh
-uv run scripts/compare_flip.py --fraction 0.5 --seed 20260925
-```
-
-By default it discovers the bundled PNG and EXR `reference`/`test` pairs. For a larger
-image collection, create a CSV manifest with paths relative to the manifest file:
-
-```csv
-name,reference,test
-scene-a,images/scene-a-reference.png,images/scene-a-test.png
-scene-b,images/scene-b-reference.exr,images/scene-b-test.exr
-```
-
-Then choose a random fraction (and optionally an engine subset or maximum case count):
-
-```sh
-uv run scripts/compare_flip.py --manifest cases.csv --fraction 0.25 --seed 42
-```
-
-To run it in the background and retain console output:
-
-```sh
-mkdir -p target/flip-bench
-nohup uv run scripts/compare_flip.py \
-  --manifest cases.csv --fraction 0.25 --seed 42 \
-  --output-dir target/flip-bench \
-  > target/flip-bench/console.log 2>&1 &
-```
-
-The script incrementally writes `report.json` and `runs.jsonl`, plus `results.csv`,
-per-engine logs, and error maps. JSON records include the command, adapter, wall time,
-reported evaluation time, all pooled FLIP statistics, exact matching-pixel fraction,
-mean channel delta, and maximum channel delta. Its defaults require score deltas no
-larger than `1e-5` and map channel deltas no larger than 3. `UV_CACHE_DIR=/tmp/uv-cache`
-can be set if the default uv cache is not writable.
-
-## Accuracy against the bundled FLIP cases
-
-On the bundled 1920x1080 PNG and EXR pairs, the Rust mean scores match the FLIP CPU and
-CUDA means to six decimal places: `0.159691` for LDR and `0.283478` for HDR/ACES. Compared
-with the FLIP C++ and CUDA maps, the GPU wgpu maps have over 99.99% exact pixels and a
-largest RGB channel difference of 3. The forced software adapter maps are over 99.98%
-exact, also with a maximum channel difference of 3. Hable and Reinhard HDR runs match
-the CUDA means to six decimal places; their map differences have the same maximum
-channel delta of 3. The HDR exposure map matches CUDA at 99.9988% of pixels. Its 25
-differing pixels out of 2,073,600 have a maximum channel delta of 210 and mean channel
-delta of 0.000358 across the map. Tiny floating-point changes make adjacent exposures
-tie or swap as the location of maximum error at those pixels.
-
-## Performance
-
-The bundled PNG and EXR pairs are 1920x1080; the EXR case evaluates 14 exposures. On
-the GTX 750 Ti Vulkan adapter, five LDR and three HDR runs of each Rust binary were
-alternated and timed in Release mode. Error and exposure map writing were disabled.
-The values are medians. “Evaluation” is the program's algorithm timer; “process” is
-wall time for the whole command, including image decoding and GPU setup.
-
-| Rust wgpu version | LDR evaluation | LDR process | HDR evaluation | HDR process |
-| --- | ---: | ---: | ---: | ---: |
-| Initial implementation | 59.1 ms | 476.3 ms | 787.4 ms | 1.523 s |
-| Optimized implementation | 35.1 ms | 393.9 ms | 421.6 ms | 1.151 s |
-
-The evaluation speedups are 1.68x for LDR and 1.87x for HDR on this case. The changes
-halve the spatial intermediate buffer, store scalar errors as scalars, use 16x8
-workgroups, and keep the HDR per-pixel maximum on the GPU. HDR now reads back both the
-error and winning-exposure maps once after all exposures, instead of reading back an
-error map after every exposure. The optimized HDR map and mean score match the initial
-implementation on the bundled case.
-
-`--profile-gpu` measured about 25.6 ms of compute passes for the final HDR exposure:
-1.9 ms for conversion and tone mapping, 6.2 and 6.0 ms for the two spatial passes,
-5.6 and 5.5 ms for the two feature passes, and 0.4 ms to update the per-pixel maximum.
-Fourteen full passes, command submission, and the final readback account for the roughly
-422 ms evaluation. Timestamp profiling adds overhead, so these pass times are only a
-guide to where GPU time goes.
-
-The comparison script also ran all backends once with error maps enabled after the
-optimization. The following values are illustrative single runs on the same case:
-
-| Backend | LDR evaluation | LDR process | HDR evaluation | HDR process |
-| --- | ---: | ---: | ---: | ---: |
-| Rust wgpu, Vulkan GPU | 38.1 ms | 0.710 s | 426.4 ms | 1.412 s |
-| FLIP CUDA | 111.8 ms | 1.108 s | 1.398 s | 2.437 s |
-| Rust wgpu, Vulkan CPU | 816.7 ms | 1.517 s | 6.467 s | 7.518 s |
-| FLIP C++ Release | 693.8 ms | 1.500 s | 10.047 s | 10.792 s |
-
-The timer scopes differ: wgpu excludes pipeline/filter setup and automatic HDR
-exposure-range selection, then includes compute dispatch and error-map readback.
-FLIP's timer surrounds `FLIP::evaluate`, including filter setup and HDR exposure
-selection. Whole-command time includes setup for both. These results are specific to
-this GTX 750 Ti, the CUDA binary built for `sm_50`, the host, and these images; they
-do not establish a general speed ranking between wgpu and CUDA. CPU timings varied
-between runs, so use the sampling script for a larger corpus or another machine.
+This project uses the BSD 3-Clause license. The FLIP-derived material and
+bundled sample images are from NVIDIA's
+[FLIP project](https://github.com/NVlabs/flip). The image files are not owned
+by the flip-wgpu contributors. See [LICENSE](LICENSE) and
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for details.
+See [API notes](docs/API.md) for input layout and wgpu integration details.

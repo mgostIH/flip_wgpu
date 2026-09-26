@@ -241,6 +241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flip-wgpu"
+version = "0.1.0"
+dependencies = [
+ "exr",
+ "png",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1250,16 +1260,6 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
-]
-
-[[package]]
-name = "wgpu_test"
-version = "0.1.0"
-dependencies = [
- "exr",
- "png",
- "pollster",
- "wgpu",
 ]
 
 [[package]]

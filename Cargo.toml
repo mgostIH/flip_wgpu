@@ -1,10 +1,28 @@
 [package]
-name = "wgpu_test"
+name = "flip-wgpu"
 version = "0.1.0"
 edition = "2024"
+description = "A wgpu compute implementation of NVIDIA's FLIP perceptual image metric"
+license = "BSD-3-Clause"
+publish = false
+default-run = "flip-wgpu"
 
 [dependencies]
+exr = { version = "1.74.2", optional = true }
+png = { version = "0.18.1", optional = true }
+pollster = { version = "1.0.1", optional = true }
+wgpu = "30.0.1"
+
+[features]
+default = ["cli"]
+cli = ["dep:exr", "dep:png", "dep:pollster"]
+
+[dev-dependencies]
 exr = "1.74.2"
 png = "0.18.1"
 pollster = "1.0.1"
-wgpu = "30.0.1"
+
+[[bin]]
+name = "flip-wgpu"
+path = "src/main.rs"
+required-features = ["cli"]
