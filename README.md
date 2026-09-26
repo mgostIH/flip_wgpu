@@ -33,6 +33,9 @@ Use `--no-error-map`, `--no-exposure-map`, or `--no-magma` to change those outpu
 summary beside the error map, and `--csv PATH` appends summary rows to a CSV file.
 Run `cargo run -- --help` for all options. Histogram plots, exit-on-threshold, and
 exporting all intermediate HDR images are not implemented.
+Use `--profile-gpu` to print GPU times for the compute passes when the adapter supports
+timestamp queries. For HDR, it profiles the final exposure; the other exposures run
+the same passes.
 
 ## What the result means
 
@@ -102,28 +105,47 @@ differing pixels out of 2,073,600 have a maximum channel delta of 210 and mean c
 delta of 0.000358 across the map. Tiny floating-point changes make adjacent exposures
 tie or swap as the location of maximum error at those pixels.
 
-## Evaluation-time benchmark
+## Performance
 
-Three serial Release-mode runs were made on the bundled 1920x1080 pair; values below are
-medians. Error and exposure map writing were disabled for every backend. “Evaluation”
-is each program's reported algorithm time; “process” is wall time around the whole
-command, including input decoding and device/program startup. HDR evaluates 14 exposures.
+The bundled PNG and EXR pairs are 1920x1080; the EXR case evaluates 14 exposures. On
+the GTX 750 Ti Vulkan adapter, five LDR and three HDR runs of each Rust binary were
+alternated and timed in Release mode. Error and exposure map writing were disabled.
+The values are medians. “Evaluation” is the program's algorithm timer; “process” is
+wall time for the whole command, including image decoding and GPU setup.
+
+| Rust wgpu version | LDR evaluation | LDR process | HDR evaluation | HDR process |
+| --- | ---: | ---: | ---: | ---: |
+| Initial implementation | 59.1 ms | 476.3 ms | 787.4 ms | 1.523 s |
+| Optimized implementation | 35.1 ms | 393.9 ms | 421.6 ms | 1.151 s |
+
+The evaluation speedups are 1.68x for LDR and 1.87x for HDR on this case. The changes
+halve the spatial intermediate buffer, store scalar errors as scalars, use 16x8
+workgroups, and keep the HDR per-pixel maximum on the GPU. HDR now reads back both the
+error and winning-exposure maps once after all exposures, instead of reading back an
+error map after every exposure. The optimized HDR map and mean score match the initial
+implementation on the bundled case.
+
+`--profile-gpu` measured about 25.6 ms of compute passes for the final HDR exposure:
+1.9 ms for conversion and tone mapping, 6.2 and 6.0 ms for the two spatial passes,
+5.6 and 5.5 ms for the two feature passes, and 0.4 ms to update the per-pixel maximum.
+Fourteen full passes, command submission, and the final readback account for the roughly
+422 ms evaluation. Timestamp profiling adds overhead, so these pass times are only a
+guide to where GPU time goes.
+
+The comparison script also ran all backends once with error maps enabled after the
+optimization. The following values are illustrative single runs on the same case:
 
 | Backend | LDR evaluation | LDR process | HDR evaluation | HDR process |
 | --- | ---: | ---: | ---: | ---: |
-| Rust wgpu, Vulkan GPU | 61.3 ms | 416.3 ms | 800.6 ms | 1.489 s |
-| FLIP CUDA | 91.2 ms | 498.8 ms | 1,363.5 ms | 1.941 s |
-| Rust wgpu, Vulkan CPU | 621.1 ms | 981.0 ms | 6.270 s | 6.993 s |
-| FLIP C++ Release | 634.0 ms | 995.2 ms | 9.241 s | 9.559 s |
+| Rust wgpu, Vulkan GPU | 38.1 ms | 0.710 s | 426.4 ms | 1.412 s |
+| FLIP CUDA | 111.8 ms | 1.108 s | 1.398 s | 2.437 s |
+| Rust wgpu, Vulkan CPU | 816.7 ms | 1.517 s | 6.467 s | 7.518 s |
+| FLIP C++ Release | 693.8 ms | 1.500 s | 10.047 s | 10.792 s |
 
-For these inputs and builds, wgpu's evaluation was about 1.49x faster than CUDA in LDR
-and 1.70x in HDR; whole-command wall time was about 1.20x and 1.30x faster, respectively.
-The wgpu CPU fallback was close to C++ for LDR and faster for HDR in this run. The timer
-scopes are not identical: wgpu's evaluation timer excludes pipeline/filter setup and
-automatic HDR exposure-range selection, then includes compute dispatch and error-map
-readback. FLIP's timer surrounds `FLIP::evaluate`, which includes its filter setup and
-HDR exposure selection. Whole-command time provides a second view with setup included.
-These results are specific to the available GTX 750 Ti, the CUDA binary built for
-`sm_50`, the host, and these cases; they are not a general performance claim about wgpu
-versus CUDA. CPU timings also varied between runs, so use the sampling script to measure
-on a larger corpus and on the machine of interest.
+The timer scopes differ: wgpu excludes pipeline/filter setup and automatic HDR
+exposure-range selection, then includes compute dispatch and error-map readback.
+FLIP's timer surrounds `FLIP::evaluate`, including filter setup and HDR exposure
+selection. Whole-command time includes setup for both. These results are specific to
+this GTX 750 Ti, the CUDA binary built for `sm_50`, the host, and these images; they
+do not establish a general speed ranking between wgpu and CUDA. CPU timings varied
+between runs, so use the sampling script for a larger corpus or another machine.

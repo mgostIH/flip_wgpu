@@ -57,6 +57,7 @@ struct CliOptions {
     exposure_count: Option<u32>,
     verbosity: u8,
     force_fallback_adapter: bool,
+    profile_gpu: bool,
     directory: PathBuf,
     basename: Option<String>,
     explicit_output: Option<PathBuf>,
@@ -96,6 +97,18 @@ struct ExrPixels {
 struct FrameResult {
     errors: Vec<f32>,
     elapsed: Duration,
+}
+
+struct HdrResult {
+    errors: Vec<f32>,
+    exposures: Vec<f32>,
+    elapsed: Duration,
+}
+
+struct GpuProfile {
+    queries: wgpu::QuerySet,
+    resolved: wgpu::Buffer,
+    readback: wgpu::Buffer,
 }
 
 struct ErrorStatistics {
@@ -146,6 +159,7 @@ struct FlipGpu {
     feature_radius: u32,
     cmax: f32,
     tone_mapper: ToneMapper,
+    gpu_profile: Option<GpuProfile>,
     params: wgpu::Buffer,
     reference_ldr: wgpu::Buffer,
     test_ldr: wgpu::Buffer,
@@ -153,18 +167,23 @@ struct FlipGpu {
     test_hdr: wgpu::Buffer,
     error_map: wgpu::Buffer,
     readback: wgpu::Buffer,
+    hdr_maximum: wgpu::Buffer,
+    hdr_winning_exposure: wgpu::Buffer,
+    hdr_readback: wgpu::Buffer,
     ldr_convert_pipeline: wgpu::ComputePipeline,
     hdr_convert_pipeline: wgpu::ComputePipeline,
     spatial_x_pipeline: wgpu::ComputePipeline,
     spatial_y_pipeline: wgpu::ComputePipeline,
     features_x_pipeline: wgpu::ComputePipeline,
     features_y_pipeline: wgpu::ComputePipeline,
+    hdr_maximum_pipeline: wgpu::ComputePipeline,
     ldr_convert_group: wgpu::BindGroup,
     hdr_convert_group: wgpu::BindGroup,
     spatial_x_group: wgpu::BindGroup,
     spatial_y_group: wgpu::BindGroup,
     features_x_group: wgpu::BindGroup,
     features_y_group: wgpu::BindGroup,
+    hdr_maximum_group: wgpu::BindGroup,
 }
 
 fn main() {
@@ -213,6 +232,7 @@ Options:
       --output PATH              Explicit error-map path (one test only)
   -v, --verbosity 0|1|2          0 quiet, 1 mean, 2 full summary (default: 2)
       --force-fallback-adapter   Prefer a software/fallback adapter
+      --profile-gpu              Print GPU time for each compute pass
       --no-error-map             Do not write the FLIP map
       --no-exposure-map          Do not write the HDR exposure map
       --no-magma                 Use grayscale for the FLIP map
@@ -237,6 +257,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             exposure_count: None,
             verbosity: 2,
             force_fallback_adapter: false,
+            profile_gpu: false,
             directory: PathBuf::from("."),
             basename: None,
             explicit_output: Some(PathBuf::from(&args[2])),
@@ -257,6 +278,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut exposure_count = None;
     let mut verbosity = 2;
     let mut force_fallback_adapter = false;
+    let mut profile_gpu = false;
     let mut directory = PathBuf::from(".");
     let mut basename = None;
     let mut explicit_output = None;
@@ -329,6 +351,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 }
             }
             "--force-fallback-adapter" => force_fallback_adapter = true,
+            "--profile-gpu" => profile_gpu = true,
             "-d" | "--directory" => {
                 directory = PathBuf::from(cli_value(args, &mut index, option)?);
             }
@@ -367,6 +390,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         exposure_count,
         verbosity,
         force_fallback_adapter,
+        profile_gpu,
         directory,
         basename,
         explicit_output,
@@ -432,6 +456,7 @@ async fn run_pair(options: &CliOptions, test_path: &Path) -> Result<(), Box<dyn 
             options.tone_mapper,
             options.verbosity,
             options.force_fallback_adapter,
+            options.profile_gpu,
         )
         .await?;
         gpu.upload_hdr(&reference, &test);
@@ -450,27 +475,13 @@ async fn run_pair(options: &CliOptions, test_path: &Path) -> Result<(), Box<dyn 
             println!("HDR tone mapper: {}", options.tone_mapper.name());
             println!("HDR exposures: {exposure_count} from {start:.6} to {stop:.6} stops");
         }
-        let step = (stop - start) / (exposure_count - 1) as f32;
-        let mut maximum_error = vec![0.0_f32; (reference.width * reference.height) as usize];
-        let mut winning_exposure = vec![0.0_f32; maximum_error.len()];
-        let evaluation_start = Instant::now();
-        for index in 0..exposure_count {
-            let exposure = start + index as f32 * step;
-            let frame = gpu.compute_hdr(exposure)?;
-            let normalized_exposure = index as f32 / (exposure_count - 1) as f32;
-            for (pixel, error) in frame.errors.into_iter().enumerate() {
-                if error > maximum_error[pixel] {
-                    maximum_error[pixel] = error;
-                    winning_exposure[pixel] = normalized_exposure;
-                }
-            }
-        }
+        let result = gpu.compute_hdr_range(start, stop, exposure_count)?;
         (
             reference.width,
             reference.height,
-            maximum_error,
-            Some(winning_exposure),
-            evaluation_start.elapsed(),
+            result.errors,
+            Some(result.exposures),
+            result.elapsed,
             Some((start, stop, exposure_count)),
         )
     } else {
@@ -484,6 +495,7 @@ async fn run_pair(options: &CliOptions, test_path: &Path) -> Result<(), Box<dyn 
             options.tone_mapper,
             options.verbosity,
             options.force_fallback_adapter,
+            options.profile_gpu,
         )
         .await?;
         gpu.upload_ldr(&reference, &test);
@@ -700,6 +712,7 @@ impl FlipGpu {
         tone_mapper: ToneMapper,
         verbosity: u8,
         force_fallback_adapter: bool,
+        profile_gpu: bool,
     ) -> Result<Self, Box<dyn Error>> {
         if width == 0 || height == 0 {
             return Err("image dimensions must be nonzero".into());
@@ -716,6 +729,7 @@ impl FlipGpu {
             cmax,
             0.0,
             tone_mapper,
+            0.0,
         );
 
         let instance = wgpu::Instance::default();
@@ -726,6 +740,9 @@ impl FlipGpu {
             })
             .await?;
         let adapter_info = adapter.get_info();
+        if profile_gpu && !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return Err("this adapter does not support GPU timestamp queries".into());
+        }
         if verbosity >= 2 {
             println!(
                 "Adapter: {} ({:?}, {:?})",
@@ -733,8 +750,38 @@ impl FlipGpu {
             );
         }
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: if profile_gpu {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
+                ..Default::default()
+            })
             .await?;
+        let gpu_profile = if profile_gpu {
+            Some(GpuProfile {
+                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("FLIP pass timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 12,
+                }),
+                resolved: empty_buffer(
+                    &device,
+                    "FLIP resolved timestamps",
+                    96,
+                    wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                ),
+                readback: empty_buffer(
+                    &device,
+                    "FLIP timestamp readback",
+                    96,
+                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                ),
+            })
+        } else {
+            None
+        };
 
         let reference_ldr = empty_buffer(
             &device,
@@ -769,13 +816,13 @@ impl FlipGpu {
         let spatial_intermediate = empty_buffer(
             &device,
             "spatial filter intermediate",
-            pixel_count * 4 * 16,
+            pixel_count * 2 * 16,
             wgpu::BufferUsages::STORAGE,
         );
         let color_difference = empty_buffer(
             &device,
             "color difference",
-            pixel_count * 16,
+            pixel_count * 4,
             wgpu::BufferUsages::STORAGE,
         );
         let feature_intermediate = empty_buffer(
@@ -787,13 +834,35 @@ impl FlipGpu {
         let error_map = empty_buffer(
             &device,
             "FLIP error map",
-            pixel_count * 16,
+            pixel_count * 4,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
         let readback = empty_buffer(
             &device,
             "FLIP error map readback",
-            pixel_count * 16,
+            pixel_count * 4,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        );
+        let hdr_maximum = empty_buffer(
+            &device,
+            "HDR maximum errors",
+            pixel_count * 4,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let hdr_winning_exposure = empty_buffer(
+            &device,
+            "HDR winning exposure",
+            pixel_count * 4,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let hdr_readback = empty_buffer(
+            &device,
+            "HDR result readback",
+            pixel_count * 8,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         );
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -827,6 +896,10 @@ impl FlipGpu {
         let features_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FLIP feature difference shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/features.wgsl").into()),
+        });
+        let hdr_maximum_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FLIP HDR maximum shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/hdr_maximum.wgsl").into()),
         });
 
         let ldr_convert_pipeline = compute_pipeline(
@@ -865,6 +938,12 @@ impl FlipGpu {
             "features_y_and_error",
             "FLIP feature Y filter and final error",
         );
+        let hdr_maximum_pipeline = compute_pipeline(
+            &device,
+            &hdr_maximum_module,
+            "reduce_hdr",
+            "FLIP HDR maximum error and exposure",
+        );
 
         let ldr_convert_group = bind_group(
             &device,
@@ -902,7 +981,7 @@ impl FlipGpu {
             &[
                 (0, &spatial_intermediate),
                 (1, &spatial_filter_buffer),
-                (2, &color_difference),
+                (4, &color_difference),
                 (3, &params),
             ],
         );
@@ -923,8 +1002,18 @@ impl FlipGpu {
                 (0, &feature_intermediate),
                 (1, &feature_filter_buffer),
                 (2, &color_difference),
-                (3, &error_map),
+                (5, &error_map),
                 (4, &params),
+            ],
+        );
+        let hdr_maximum_group = bind_group(
+            &device,
+            &hdr_maximum_pipeline,
+            &[
+                (0, &error_map),
+                (1, &hdr_maximum),
+                (2, &hdr_winning_exposure),
+                (3, &params),
             ],
         );
 
@@ -943,6 +1032,7 @@ impl FlipGpu {
             feature_radius,
             cmax,
             tone_mapper,
+            gpu_profile,
             params,
             reference_ldr,
             test_ldr,
@@ -950,18 +1040,23 @@ impl FlipGpu {
             test_hdr,
             error_map,
             readback,
+            hdr_maximum,
+            hdr_winning_exposure,
+            hdr_readback,
             ldr_convert_pipeline,
             hdr_convert_pipeline,
             spatial_x_pipeline,
             spatial_y_pipeline,
             features_x_pipeline,
             features_y_pipeline,
+            hdr_maximum_pipeline,
             ldr_convert_group,
             hdr_convert_group,
             spatial_x_group,
             spatial_y_group,
             features_x_group,
             features_y_group,
+            hdr_maximum_group,
         })
     }
 
@@ -983,76 +1078,124 @@ impl FlipGpu {
     }
 
     fn compute_ldr(&self) -> Result<FrameResult, Box<dyn Error>> {
-        self.compute_frame(false, 0.0)
+        self.compute_frame()
     }
 
-    fn compute_hdr(&self, exposure: f32) -> Result<FrameResult, Box<dyn Error>> {
-        self.compute_frame(true, exposure)
-    }
-
-    fn compute_frame(&self, hdr: bool, exposure: f32) -> Result<FrameResult, Box<dyn Error>> {
+    fn compute_hdr_range(
+        &self,
+        start: f32,
+        stop: f32,
+        count: u32,
+    ) -> Result<HdrResult, Box<dyn Error>> {
         let started = Instant::now();
-        if hdr {
-            let params = params_bytes(
-                self.width,
-                self.height,
-                self.spatial_radius,
-                self.feature_radius,
-                self.cmax,
-                exposure,
-                self.tone_mapper,
+        let pixel_bytes = self.width as u64 * self.height as u64 * 4;
+        let step = (stop - start) / (count - 1) as f32;
+        for index in 0..count {
+            let exposure = start + index as f32 * step;
+            let fraction = index as f32 / (count - 1) as f32;
+            self.queue.write_buffer(
+                &self.params,
+                0,
+                &params_bytes(
+                    self.width,
+                    self.height,
+                    self.spatial_radius,
+                    self.feature_radius,
+                    self.cmax,
+                    exposure,
+                    self.tone_mapper,
+                    fraction,
+                ),
             );
-            self.queue.write_buffer(&self.params, 0, &params);
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("FLIP HDR exposure encoder"),
+                });
+            if index == 0 {
+                encoder.clear_buffer(&self.hdr_maximum, 0, None);
+                encoder.clear_buffer(&self.hdr_winning_exposure, 0, None);
+            }
+            let profile_last_exposure = index + 1 == count;
+            self.encode_frame_passes(&mut encoder, true, profile_last_exposure);
+            dispatch(
+                &mut encoder,
+                &self.hdr_maximum_pipeline,
+                &self.hdr_maximum_group,
+                self.width.div_ceil(16),
+                self.height.div_ceil(8),
+                if profile_last_exposure {
+                    self.gpu_profile
+                        .as_ref()
+                        .map(|profile| (&profile.queries, 10))
+                } else {
+                    None
+                },
+            );
+            if profile_last_exposure {
+                if let Some(profile) = &self.gpu_profile {
+                    encoder.resolve_query_set(&profile.queries, 0..12, &profile.resolved, 0);
+                    encoder.copy_buffer_to_buffer(&profile.resolved, 0, &profile.readback, 0, 96);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &self.hdr_maximum,
+                    0,
+                    &self.hdr_readback,
+                    0,
+                    pixel_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &self.hdr_winning_exposure,
+                    0,
+                    &self.hdr_readback,
+                    pixel_bytes,
+                    pixel_bytes,
+                );
+            }
+            self.queue.submit([encoder.finish()]);
         }
 
-        let (convert_pipeline, convert_group) = if hdr {
-            (&self.hdr_convert_pipeline, &self.hdr_convert_group)
-        } else {
-            (&self.ldr_convert_pipeline, &self.ldr_convert_group)
-        };
-        let workgroups_x = self.width.div_ceil(8);
-        let workgroups_y = self.height.div_ceil(8);
+        let (sender, receiver) = mpsc::channel();
+        self.hdr_readback
+            .map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = sender.send(result);
+            });
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        receiver.recv()??;
+        let mapped = self.hdr_readback.get_mapped_range(..)?;
+        let (errors_bytes, exposures_bytes) = mapped.split_at(pixel_bytes as usize);
+        let errors = errors_bytes
+            .chunks_exact(4)
+            .map(|pixel| f32::from_ne_bytes(pixel.try_into().expect("f32 bytes")))
+            .collect();
+        let exposures = exposures_bytes
+            .chunks_exact(4)
+            .map(|pixel| f32::from_ne_bytes(pixel.try_into().expect("f32 bytes")))
+            .collect();
+        drop(mapped);
+        self.hdr_readback.unmap();
+        self.print_gpu_profile(true)?;
+        Ok(HdrResult {
+            errors,
+            exposures,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    fn compute_frame(&self) -> Result<FrameResult, Box<dyn Error>> {
+        let started = Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("FLIP compute encoder"),
             });
-        dispatch(
-            &mut encoder,
-            convert_pipeline,
-            convert_group,
-            workgroups_x,
-            workgroups_y,
-        );
-        dispatch(
-            &mut encoder,
-            &self.spatial_x_pipeline,
-            &self.spatial_x_group,
-            workgroups_x,
-            workgroups_y,
-        );
-        dispatch(
-            &mut encoder,
-            &self.spatial_y_pipeline,
-            &self.spatial_y_group,
-            workgroups_x,
-            workgroups_y,
-        );
-        dispatch(
-            &mut encoder,
-            &self.features_x_pipeline,
-            &self.features_x_group,
-            workgroups_x,
-            workgroups_y,
-        );
-        dispatch(
-            &mut encoder,
-            &self.features_y_pipeline,
-            &self.features_y_group,
-            workgroups_x,
-            workgroups_y,
-        );
-        let buffer_size = (self.width as u64) * (self.height as u64) * 16;
+        self.encode_frame_passes(&mut encoder, false, true);
+        if let Some(profile) = &self.gpu_profile {
+            encoder.resolve_query_set(&profile.queries, 0..10, &profile.resolved, 0);
+            encoder.copy_buffer_to_buffer(&profile.resolved, 0, &profile.readback, 0, 80);
+        }
+        let buffer_size = (self.width as u64) * (self.height as u64) * 4;
         encoder.copy_buffer_to_buffer(&self.error_map, 0, &self.readback, 0, buffer_size);
         self.queue.submit([encoder.finish()]);
 
@@ -1066,15 +1209,93 @@ impl FlipGpu {
 
         let mapped = self.readback.get_mapped_range(..)?;
         let errors = mapped
-            .chunks_exact(16)
+            .chunks_exact(4)
             .map(|pixel| f32::from_ne_bytes(pixel[0..4].try_into().expect("f32 bytes")))
             .collect();
         drop(mapped);
         self.readback.unmap();
+        self.print_gpu_profile(false)?;
         Ok(FrameResult {
             errors,
             elapsed: started.elapsed(),
         })
+    }
+
+    fn print_gpu_profile(&self, hdr: bool) -> Result<(), Box<dyn Error>> {
+        if let Some(profile) = &self.gpu_profile {
+            let (sender, receiver) = mpsc::channel();
+            profile
+                .readback
+                .map_async(wgpu::MapMode::Read, .., move |result| {
+                    let _ = sender.send(result);
+                });
+            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            receiver.recv()??;
+            let timestamps = profile.readback.get_mapped_range(..)?;
+            let ticks: Vec<u64> = timestamps
+                .chunks_exact(8)
+                .map(|bytes| u64::from_ne_bytes(bytes.try_into().expect("timestamp bytes")))
+                .collect();
+            drop(timestamps);
+            profile.readback.unmap();
+            let period = self.queue.get_timestamp_period();
+            let mut names = vec![
+                "convert",
+                "spatial X",
+                "spatial Y",
+                "features X",
+                "features Y",
+            ];
+            if hdr {
+                names.push("HDR maximum");
+                println!("GPU pass times for the final HDR exposure:");
+            }
+            let mut total_ms = 0.0;
+            for (index, name) in names.iter().enumerate() {
+                let elapsed_ms = ticks[index * 2 + 1].saturating_sub(ticks[index * 2]) as f32
+                    * period
+                    / 1_000_000.0;
+                total_ms += elapsed_ms;
+                println!("GPU pass {name}: {elapsed_ms:.3} ms");
+            }
+            println!("GPU pass sum: {total_ms:.3} ms");
+        }
+        Ok(())
+    }
+
+    fn encode_frame_passes(&self, encoder: &mut wgpu::CommandEncoder, hdr: bool, profile: bool) {
+        let (convert_pipeline, convert_group) = if hdr {
+            (&self.hdr_convert_pipeline, &self.hdr_convert_group)
+        } else {
+            (&self.ldr_convert_pipeline, &self.ldr_convert_group)
+        };
+        let workgroups_x = self.width.div_ceil(16);
+        let workgroups_y = self.height.div_ceil(8);
+        for (index, (pipeline, group)) in [
+            (convert_pipeline, convert_group),
+            (&self.spatial_x_pipeline, &self.spatial_x_group),
+            (&self.spatial_y_pipeline, &self.spatial_y_group),
+            (&self.features_x_pipeline, &self.features_x_group),
+            (&self.features_y_pipeline, &self.features_y_group),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            dispatch(
+                encoder,
+                pipeline,
+                group,
+                workgroups_x,
+                workgroups_y,
+                if profile {
+                    self.gpu_profile
+                        .as_ref()
+                        .map(|profile| (&profile.queries, index as u32 * 2))
+                } else {
+                    None
+                },
+            );
+        }
     }
 }
 
@@ -1228,6 +1449,7 @@ fn params_bytes(
     cmax: f32,
     exposure: f32,
     tone_mapper: ToneMapper,
+    exposure_fraction: f32,
 ) -> Vec<u8> {
     [
         width.to_ne_bytes(),
@@ -1241,7 +1463,7 @@ fn params_bytes(
         FLIP_CONSTANTS.gqf.to_ne_bytes(),
         exposure.to_ne_bytes(),
         tone_mapper.id().to_ne_bytes(),
-        0.0_f32.to_ne_bytes(),
+        exposure_fraction.to_ne_bytes(),
     ]
     .into_iter()
     .flatten()
@@ -1469,10 +1691,15 @@ fn dispatch(
     bind_group: &wgpu::BindGroup,
     workgroups_x: u32,
     workgroups_y: u32,
+    timestamp: Option<(&wgpu::QuerySet, u32)>,
 ) {
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("FLIP compute pass"),
-        timestamp_writes: None,
+        timestamp_writes: timestamp.map(|(query_set, index)| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(index),
+            end_of_pass_write_index: Some(index + 1),
+        }),
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);

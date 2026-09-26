@@ -17,6 +17,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> filters: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> destination: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> error_destination: array<f32>;
 
 fn clamp_x(x: i32) -> u32 {
     return u32(clamp(x, 0, i32(params.width) - 1));
@@ -95,7 +96,7 @@ fn hyab(a: vec3<f32>, b: vec3<f32>) -> f32 {
     return abs(a.x - b.x) + sqrt(d.x * d.x + d.y * d.y);
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 8)
 fn spatial_x(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= params.width || id.y >= params.height) {
         return;
@@ -124,14 +125,12 @@ fn spatial_x(@builtin(global_invocation_id) id: vec3<u32>) {
         test_cz1 += weight.z * test_color.z;
         test_cz2 += weight.w * test_color.z;
     }
-    let out_index = pixel_index * 4u;
-    destination[out_index] = vec4<f32>(ref_y, ref_cx, 0.0, 0.0);
-    destination[out_index + 1u] = vec4<f32>(ref_cz1, ref_cz2, 0.0, 0.0);
-    destination[out_index + 2u] = vec4<f32>(test_y, test_cx, 0.0, 0.0);
-    destination[out_index + 3u] = vec4<f32>(test_cz1, test_cz2, 0.0, 0.0);
+    let out_index = pixel_index * 2u;
+    destination[out_index] = vec4<f32>(ref_y, ref_cx, ref_cz1, ref_cz2);
+    destination[out_index + 1u] = vec4<f32>(test_y, test_cx, test_cz1, test_cz2);
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 8)
 fn spatial_y(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= params.width || id.y >= params.height) {
         return;
@@ -147,20 +146,18 @@ fn spatial_y(@builtin(global_invocation_id) id: vec3<u32>) {
     var test_cz2 = 0.0;
     for (var offset = -i32(params.spatial_radius); offset <= i32(params.spatial_radius); offset += 1) {
         let y = clamp_y(i32(id.y) + offset);
-        let sample_index = (y * params.width + id.x) * 4u;
+        let sample_index = (y * params.width + id.x) * 2u;
         let weight = filters[u32(offset + i32(params.spatial_radius))];
-        let ref_ycx = source[sample_index];
-        let ref_cz = source[sample_index + 1u];
-        let test_ycx = source[sample_index + 2u];
-        let test_cz = source[sample_index + 3u];
-        ref_y += weight.x * ref_ycx.x;
-        ref_cx += weight.y * ref_ycx.y;
-        ref_cz1 += weight.z * ref_cz.x;
-        ref_cz2 += weight.w * ref_cz.y;
-        test_y += weight.x * test_ycx.x;
-        test_cx += weight.y * test_ycx.y;
-        test_cz1 += weight.z * test_cz.x;
-        test_cz2 += weight.w * test_cz.y;
+        let ref_color = source[sample_index];
+        let test_color = source[sample_index + 1u];
+        ref_y += weight.x * ref_color.x;
+        ref_cx += weight.y * ref_color.y;
+        ref_cz1 += weight.z * ref_color.z;
+        ref_cz2 += weight.w * ref_color.w;
+        test_y += weight.x * test_color.x;
+        test_cx += weight.y * test_color.y;
+        test_cz1 += weight.z * test_color.z;
+        test_cz2 += weight.w * test_color.w;
     }
 
     let ref_lab = to_lab_hunt(vec3<f32>(ref_y, ref_cx, ref_cz1 + ref_cz2));
@@ -174,5 +171,5 @@ fn spatial_y(@builtin(global_invocation_id) id: vec3<u32>) {
             + ((color_difference - params.pccmax) / (params.cmax - params.pccmax))
                 * (1.0 - params.gpt);
     }
-    destination[pixel_index] = vec4<f32>(mapped_difference, 0.0, 0.0, 0.0);
+    error_destination[pixel_index] = mapped_difference;
 }

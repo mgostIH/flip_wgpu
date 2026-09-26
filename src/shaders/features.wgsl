@@ -15,9 +15,10 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> filters: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> color_difference: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> color_difference: array<f32>;
 @group(0) @binding(3) var<storage, read_write> destination: array<vec4<f32>>;
 @group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read_write> error_destination: array<f32>;
 
 fn clamp_x(x: i32) -> u32 {
     return u32(clamp(x, 0, i32(params.width) - 1));
@@ -27,7 +28,7 @@ fn clamp_y(y: i32) -> u32 {
     return u32(clamp(y, 0, i32(params.height) - 1));
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 8)
 fn features_x(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= params.width || id.y >= params.height) {
         return;
@@ -56,7 +57,7 @@ fn features_x(@builtin(global_invocation_id) id: vec3<u32>) {
     destination[pixel_index * 2u + 1u] = vec4<f32>(test_dx, test_ddx, test_gaussian, 0.0);
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 8)
 fn features_y_and_error(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= params.width || id.y >= params.height) {
         return;
@@ -95,6 +96,6 @@ fn features_y_and_error(@builtin(global_invocation_id) id: vec3<u32>) {
         (1.0 / sqrt(2.0)) * max(edge_difference, point_difference),
         params.gqf,
     );
-    let error = pow(color_difference[pixel_index].x, 1.0 - feature_difference);
-    destination[pixel_index] = vec4<f32>(error, 0.0, 0.0, 0.0);
+    let error = pow(color_difference[pixel_index], 1.0 - feature_difference);
+    error_destination[pixel_index] = error;
 }
